@@ -1,4 +1,4 @@
-import os, json, re, requests, asyncio, random
+import os, re, requests, asyncio, random, psycopg2
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -7,169 +7,137 @@ from telegram.error import BadRequest
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 IPRN_TOKEN = os.environ.get("IPRN_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-
+DATABASE_URL = os.environ.get("DATABASE_URL")
 BASE_URL = "https://api.iprn.pro"
 HEADERS = {"Authorization": f"Bearer {IPRN_TOKEN}", "Accept": "application/json"}
 
-ALLOWED_FILE = "allowed_users.json"
-DATA_FILE = "user_stats.json"
-STOCK_FILE = "custom_stock.json"
-SEEN_FILE = "seen_sms.json"
+def get_db(): return psycopg2.connect(DATABASE_URL)
+def init_db():
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS stock (number TEXT PRIMARY KEY)")
+    cur.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY)")
+    cur.execute("CREATE TABLE IF NOT EXISTS user_numbers (user_id BIGINT, number TEXT, PRIMARY KEY(user_id, number))")
+    cur.execute("CREATE TABLE IF NOT EXISTS seen (sms_id TEXT PRIMARY KEY)")
+    cur.execute("INSERT INTO users (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (ADMIN_ID,))
+    conn.commit(); cur.close(); conn.close()
 
-def load_json(f, d):
-    try:
-        with open(f,'r') as fp: return json.load(fp)
-    except: return d
-def save_json(f, d):
-    with open(f,'w') as fp: json.dump(d, fp, indent=2)
-
-def is_allowed(uid): return uid in load_json(ALLOWED_FILE, [ADMIN_ID])
-def is_admin(uid): return uid == ADMIN_ID
-
-def clean_num(n):
-    return re.sub(r'\D','', str(n))[-10:] # last 10 digit diye match
-
-def extract_otp(t):
-    m=re.search(r'\b\d{4,8}\b', t)
-    return m.group(0) if m else None
-
+def clean_num(n): return re.sub(r'\D','', str(n))[-10:]
 def api_get(e,p={}):
-    try:
-        r=requests.get(f"{BASE_URL}{e}", headers=HEADERS, params=p, timeout=15)
-        print(f"API {e} -> {r.status_code}")
-        return r.json()
-    except Exception as ex:
-        print(f"API Error {ex}")
-        return {}
-
-seen_sms=set(load_json(SEEN_FILE, []))
+    try: return requests.get(f"{BASE_URL}{e}", headers=HEADERS, params=p, timeout=15).json()
+    except: return {}
 
 async def auto_forwarder(app):
-    global seen_sms
-    print("✅ Auto Forwarder Started...")
+    print("✅ Forwarder Started")
     while True:
         await asyncio.sleep(8)
         try:
             day=datetime.now().strftime("%Y-%m-%d")
-            # 1st try with day, 2nd try without day
-            data=api_get("/api/stock/public/edr",{"page":1,"perPage":100,"day":day})
-            all_sms=data.get('data',[])
-            if not all_sms:
-                data=api_get("/api/stock/public/edr",{"page":1,"perPage":100})
-                all_sms=data.get('data',[])
-
-            if not all_sms: continue
-
-            stats=load_json(DATA_FILE,{})
-            for sms in all_sms:
-                mid=str(sms.get('id'))
-                if mid in seen_sms: continue
-
-                api_b = clean_num(sms.get('b_number',''))
-
-                for uid_str, ud in stats.items():
-                    for un in ud.get('numbers',[]):
-                        if clean_num(un) == api_b:
-                            # MATCH FOUND
-                            seen_sms.add(mid)
-                            save_json(SEEN_FILE, list(seen_sms))
-                            otp=extract_otp(sms.get('message',''))
-                            txt=f"🔔 **NEW OTP RECEIVED**\n\n📱 Number: `{un}`\n📩 From: `{sms.get('a_number','')}`\n\n**Message:**\n{sms.get('message','')}"
-                            if otp: txt+=f"\n\n🔑 **OTP: `{otp}`**"
-                            try:
-                                await app.bot.send_message(chat_id=int(uid_str), text=txt, parse_mode='Markdown')
-                                print(f"Sent OTP to {uid_str} for {un}")
-                                ud['count']=ud.get('count',0)+1
-                                save_json(DATA_FILE, stats)
-                            except Exception as e:
-                                print(f"Send fail {uid_str}: {e}")
-                            break
-        except Exception as e:
-            print(f"Forwarder Loop Error: {e}")
+            data=api_get("/api/stock/public/edr",{"page":1,"perPage":100,"day":day}).get('data',[])
+            if not data: data=api_get("/api/stock/public/edr",{"page":1,"perPage":100}).get('data',[])
+            if not data: continue
+            conn=get_db(); cur=conn.cursor()
+            for sms in data:
+                mid=str(sms.get('id')); cur.execute("SELECT 1 FROM seen WHERE sms_id=%s",(mid,));
+                if cur.fetchone(): continue
+                api_b=clean_num(sms.get('b_number',''))
+                cur.execute("SELECT user_id, number FROM user_numbers"); rows=cur.fetchall()
+                for uid, unum in rows:
+                    if clean_num(unum)==api_b:
+                        cur.execute("INSERT INTO seen VALUES (%s) ON CONFLICT DO NOTHING",(mid,)); conn.commit()
+                        txt=f"🔔 **NEW OTP**\n📱 `{unum}`\n💬 {sms.get('message','')}"
+                        try: await app.bot.send_message(chat_id=int(uid), text=txt, parse_mode='Markdown')
+                        except: pass
+                        break
+            cur.close(); conn.close()
+        except Exception as e: print(e)
 
 def main_menu(uid):
     kb=[[InlineKeyboardButton("🎁 Get 3 Numbers", callback_data="get_3_numbers"), InlineKeyboardButton("📞 My Numbers", callback_data="my_numbers")]]
-    if is_admin(uid): kb.append([InlineKeyboardButton("📦 Manage Stock", callback_data="manage_stock"), InlineKeyboardButton("📈 Admin Stats", callback_data="admin_stats")])
+    if uid==ADMIN_ID: kb.append([InlineKeyboardButton("📦 Manage Stock", callback_data="manage_stock"), InlineKeyboardButton("📈 Admin Stats", callback_data="admin_stats")])
     return InlineKeyboardMarkup(kb)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid=update.effective_user.id
-    if not is_allowed(uid):
-        await update.message.reply_text(f"⛔ Access Denied. ID: `{uid}`"); return
-    stock=load_json(STOCK_FILE,[])
-    await update.message.reply_text(f"👋 **Welcome**\n📦 Stock: {len(stock)}", reply_markup=main_menu(uid), parse_mode='Markdown')
+    conn=get_db(); cur=conn.cursor(); cur.execute("SELECT 1 FROM users WHERE user_id=%s",(update.effective_user.id,)); ok=cur.fetchone() or update.effective_user.id==ADMIN_ID; cur.close(); conn.close()
+    if not ok: await update.message.reply_text(f"⛔ ID: {update.effective_user.id}"); return
+    conn=get_db(); cur=conn.cursor(); cur.execute("SELECT COUNT(*) FROM stock"); c=cur.fetchone()[0]; cur.close(); conn.close()
+    await update.message.reply_text(f"👋 Welcome\n📦 Stock: {c}", reply_markup=main_menu(update.effective_user.id), parse_mode='Markdown')
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query=update.callback_query
-    await query.answer()
-    uid=query.from_user.id
-    if not is_allowed(uid): return
-    stats=load_json(DATA_FILE,{})
-    if str(uid) not in stats: stats[str(uid)]={"count":0,"numbers":[]}
-    stock=load_json(STOCK_FILE,[])
+    query=update.callback_query; await query.answer(); uid=query.from_user.id
     try:
         if query.data=="get_3_numbers":
-            taken=[]
-            for u in stats.values(): taken.extend([str(x) for x in u.get('numbers',[])])
-            free=[n for n in stock if clean_num(n) not in [clean_num(x) for x in taken]]
-            if len(free)<3:
-                await query.edit_message_text(f"⚠️ Stock Low: {len(free)}", reply_markup=main_menu(uid)); return
+            conn=get_db(); cur=conn.cursor(); cur.execute("SELECT number FROM stock"); all_stock=[r[0] for r in cur.fetchall()]; cur.execute("SELECT number FROM user_numbers"); taken=[r[0] for r in cur.fetchall()]
+            free=[n for n in all_stock if clean_num(n) not in [clean_num(t) for t in taken]]
+            if len(free)<3: await query.edit_message_text(f"⚠️ Low Stock {len(free)}", reply_markup=main_menu(uid)); cur.close(); conn.close(); return
             picked=random.sample(free,3)
-            stats[str(uid)]["numbers"].extend(picked)
-            save_json(DATA_FILE, stats)
-            await query.edit_message_text(f"✅ 3 Numbers:\n" + "\n".join([f"`{n}`" for n in picked]), reply_markup=main_menu(uid), parse_mode='Markdown')
+            for n in picked: cur.execute("INSERT INTO user_numbers VALUES (%s,%s) ON CONFLICT DO NOTHING",(uid,n))
+            conn.commit(); cur.close(); conn.close()
+            await query.edit_message_text("✅ Assigned:\n" + "\n".join([f"`{n}`" for n in picked]), reply_markup=main_menu(uid), parse_mode='Markdown')
         elif query.data=="my_numbers":
-            nums=stats[str(uid)].get("numbers",[])
-            txt=f"📞 Your Numbers ({len(nums)})\n\n" + "\n".join([f"`{n}`" for n in nums]) if nums else "📭 No numbers yet."
-            await query.edit_message_text(txt, reply_markup=main_menu(uid), parse_mode='Markdown')
-        elif query.data=="manage_stock" and is_admin(uid):
-            taken=[]
-            for u in stats.values(): taken.extend(u.get('numbers',[]))
-            free=len([n for n in stock if clean_num(n) not in [clean_num(x) for x in taken]])
-            await query.edit_message_text(f"📦 Stock: {len(stock)} | Free: {free}\n/addstock 1202.. \n/stock", reply_markup=main_menu(uid))
-        elif query.data=="admin_stats" and is_admin(uid):
-            msg="📈 **STATS**\n\n"
-            for u_id,d in stats.items(): msg+=f"`{u_id}` | OTPs: {d.get('count',0)} | Nums: {len(d.get('numbers',[]))}\n"
+            conn=get_db(); cur=conn.cursor(); cur.execute("SELECT number FROM user_numbers WHERE user_id=%s",(uid,)); nums=[r[0] for r in cur.fetchall()]; cur.close(); conn.close()
+            await query.edit_message_text("📞 Yours:\n" + "\n".join([f"`{n}`" for n in nums]) if nums else "No numbers", reply_markup=main_menu(uid), parse_mode='Markdown')
+        elif query.data=="manage_stock":
+            conn=get_db(); cur=conn.cursor(); cur.execute("SELECT COUNT(*) FROM stock"); t=cur.fetchone()[0]; cur.execute("SELECT COUNT(*) FROM user_numbers"); a=cur.fetchone()[0]; cur.close(); conn.close()
+            await query.edit_message_text(f"📦 Total:{t} Assigned:{a} Free:{t-a}\n/addstock /removestock /stock /clearstock /add /remove", reply_markup=main_menu(uid))
+        elif query.data=="admin_stats":
+            conn=get_db(); cur=conn.cursor(); cur.execute("SELECT user_id FROM users"); users=cur.fetchall()
+            msg="📈 **ADMIN STATS**\n\n"
+            for (u_id,) in users:
+                cur.execute("SELECT COUNT(*) FROM user_numbers WHERE user_id=%s",(u_id,)); cnt=cur.fetchone()[0]
+                msg+=f"👤 `{u_id}` | Nums: {cnt}\n"
+            cur.execute("SELECT COUNT(*) FROM stock"); msg+=f"\n📦 Stock: {cur.fetchone()[0]}"
+            cur.close(); conn.close()
             await query.edit_message_text(msg, reply_markup=main_menu(uid), parse_mode='Markdown')
-    except BadRequest:
-        pass # Ignore same message error
+    except BadRequest: pass
 
 async def add_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    stock=load_json(STOCK_FILE,[])
-    nums=[re.sub(r'\D','',x) for x in context.args]
-    added=0
-    for n in nums:
-        if n not in stock and len(n)>=8: stock.append(n); added+=1
-    save_json(STOCK_FILE, stock)
-    await update.message.reply_text(f"✅ Added {added} | Total {len(stock)}")
+    if update.effective_user.id!=ADMIN_ID: return
+    conn=get_db(); cur=conn.cursor(); added=0
+    for a in context.args:
+        n=re.sub(r'\D','',a)
+        if len(n)>=8: cur.execute("INSERT INTO stock VALUES (%s) ON CONFLICT DO NOTHING",(n,)); added+=cur.rowcount
+    conn.commit(); cur.close(); conn.close(); await update.message.reply_text(f"Added {added}")
+
+async def remove_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id!=ADMIN_ID: return
+    conn=get_db(); cur=conn.cursor()
+    for a in context.args:
+        n=re.sub(r'\D','',a); cur.execute("DELETE FROM stock WHERE number=%s",(n,)); cur.execute("DELETE FROM user_numbers WHERE number=%s",(n,))
+    conn.commit(); cur.close(); conn.close(); await update.message.reply_text("Removed from stock")
 
 async def stock_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    stock=load_json(STOCK_FILE,[])
-    await update.message.reply_text(f"📦 {len(stock)}:\n" + "\n".join(stock[:50]))
+    if update.effective_user.id!=ADMIN_ID: return
+    conn=get_db(); cur=conn.cursor(); cur.execute("SELECT number FROM stock"); rows=cur.fetchall(); cur.close(); conn.close()
+    await update.message.reply_text("\n".join([r[0] for r in rows[:100]]) or "Empty")
 
 async def clear_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    save_json(STOCK_FILE, [])
-    await update.message.reply_text("🗑 Cleared")
+    if update.effective_user.id!=ADMIN_ID: return
+    conn=get_db(); cur=conn.cursor(); cur.execute("DELETE FROM stock"); cur.execute("DELETE FROM user_numbers"); cur.execute("DELETE FROM seen"); conn.commit(); cur.close(); conn.close()
+    await update.message.reply_text("Cleared All")
 
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    nid=int(context.args[0]); users=load_json(ALLOWED_FILE,[])
-    if nid not in users: users.append(nid); save_json(ALLOWED_FILE, users)
-    await update.message.reply_text(f"Added {nid}")
+    if update.effective_user.id!=ADMIN_ID: return
+    conn=get_db(); cur=conn.cursor()
+    for a in context.args: cur.execute("INSERT INTO users VALUES (%s) ON CONFLICT DO NOTHING",(int(a),))
+    conn.commit(); cur.close(); conn.close(); await update.message.reply_text("User Added")
 
-async def post_init(app): asyncio.create_task(auto_forwarder(app))
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id!=ADMIN_ID: return
+    conn=get_db(); cur=conn.cursor()
+    for a in context.args: cur.execute("DELETE FROM users WHERE user_id=%s",(int(a),)); cur.execute("DELETE FROM user_numbers WHERE user_id=%s",(int(a),))
+    conn.commit(); cur.close(); conn.close(); await update.message.reply_text("User Removed")
+
+async def post_init(app): init_db(); asyncio.create_task(auto_forwarder(app))
 
 def main():
     app=Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add_user))
+    app.add_handler(CommandHandler("remove", remove_user))
     app.add_handler(CommandHandler("addstock", add_stock))
+    app.add_handler(CommandHandler("removestock", remove_stock))
     app.add_handler(CommandHandler("stock", stock_list))
     app.add_handler(CommandHandler("clearstock", clear_stock))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.run_polling()
-
 if __name__=="__main__": main()
