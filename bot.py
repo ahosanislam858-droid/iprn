@@ -32,35 +32,30 @@ def api_get(endpoint, params={}):
         return r.json()
     except: return {}
 
-# --- AUTO FORWARD SYSTEM ---
+# --- AUTO FORWARDER ---
 seen_sms = set()
 async def auto_forwarder(app):
     print("Auto Forwarder Started...")
     while True:
-        await asyncio.sleep(10) # 10 sec por por check
+        await asyncio.sleep(10)
         try:
             day = datetime.now().strftime("%Y-%m-%d")
-            all_sms = api_get("/api/stock/public/edr", {"page":1,"perPage":50,"day":day}).get('data',[])
+            all_sms = api_get("/api/stock/public/edr", {"page":1,"perPage":100,"day":day}).get('data',[])
             stats = load_json(DATA_FILE, {})
-
             for sms in all_sms:
-                uid = f"{sms['b_number']}_{sms['created_at']}"
-                if uid in seen_sms: continue
-                seen_sms.add(uid)
-
-                # kon user er number e sms asche khujo
+                uid_key = f"{sms['b_number']}_{sms['created_at']}_{sms['id']}"
+                if uid_key in seen_sms: continue
+                seen_sms.add(uid_key)
                 for user_id_str, data in stats.items():
                     if str(sms['b_number']) in [str(n) for n in data.get('numbers',[])]:
                         otp = extract_otp(sms['message'])
-                        text = f"🔔 **NEW OTP AUTO FORWARD**\n\n📱 To: `{sms['b_number']}`\n📩 From: {sms['a_number']}\n\n{sms['message']}"
-                        if otp: text += f"\n\n🔑 **CODE: `{otp}`**"
+                        text = f"🔔 **NEW OTP RECEIVED**\n\n📱 Number: `{sms['b_number']}`\n📩 From: `{sms['a_number']}`\n🕒 Time: {sms['created_at']}\n\n**Message:**\n{sms['message']}"
+                        if otp: text += f"\n\n🔑 **OTP CODE: `{otp}`**"
                         try:
                             await app.bot.send_message(chat_id=int(user_id_str), text=text, parse_mode='Markdown')
-                            # count barao
                             stats[user_id_str]['count'] = stats[user_id_str].get('count',0)+1
                             save_json(DATA_FILE, stats)
-                        except Exception as e:
-                            print(f"Forward fail {user_id_str}: {e}")
+                        except: pass
                         break
         except Exception as e:
             print(f"Auto loop error: {e}")
@@ -68,17 +63,23 @@ async def auto_forwarder(app):
 def main_menu(uid):
     kb = [
         [InlineKeyboardButton("🎁 Get 3 Numbers", callback_data="get_3_numbers"), InlineKeyboardButton("📞 My Numbers", callback_data="my_numbers")],
-        [InlineKeyboardButton("📩 Live OTPs", callback_data="my_otps")],
+        [InlineKeyboardButton("📊 My Stats", callback_data="my_stats")],
     ]
     if is_admin(uid):
-        kb.append([InlineKeyboardButton("📊 Admin Stats", callback_data="admin_stats"), InlineKeyboardButton("👥 Users", callback_data="manage_users")])
+        kb.append([InlineKeyboardButton("📈 Admin Panel", callback_data="admin_stats"), InlineKeyboardButton("👥 Users List", callback_data="manage_users")])
     return InlineKeyboardMarkup(kb)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_allowed(uid):
-        await update.message.reply_text(f"❌ Access Denied\nID: `{uid}`"); return
-    await update.message.reply_text(f"👋 **Welcome to Private IPRN Bot**\n\n🎁 Get 3 Numbers e click kore 3 ta number nao.\nTarpor OTP auto tomar inbox e asbe.", reply_markup=main_menu(uid), parse_mode='Markdown')
+        await update.message.reply_text(f"⛔ Access Denied.\nYour ID: `{uid}`\nContact Admin."); return
+    await update.message.reply_text(
+        "👋 **Welcome to IPRN Private Panel**\n\n"
+        "• Click **Get 3 Numbers** to get numbers\n"
+        "• OTP will be auto forwarded to your inbox\n"
+        "• No duplicate numbers will be assigned\n\n"
+        "Status: ✅ Active",
+        reply_markup=main_menu(uid), parse_mode='Markdown')
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -90,67 +91,67 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(uid) not in stats: stats[str(uid)] = {"count":0, "numbers":[]}
 
     if query.data == "get_3_numbers":
-        if len(stats[str(uid)]["numbers"]) >= 3:
-            await query.edit_message_text(f"❌ Tumi already 3 ta niye niso:\n{stats[str(uid)]['numbers']}", reply_markup=main_menu(uid)); return
+        await query.edit_message_text("🔍 Fetching 3 new numbers from stock...", reply_markup=main_menu(uid))
 
-        # IPRN theke available number ano
-        await query.edit_message_text("🔍 Tomar jonno 3 ta number khujchi...", reply_markup=main_menu(uid))
-        data = api_get("/api/stock/public/assigned-numbers", {"page":1,"perPage":50}).get('data',[])
-
+        data = api_get("/api/stock/public/assigned-numbers", {"page":1,"perPage":100}).get('data',[])
         all_available = []
         for item in data:
             all_available.extend([str(n) for n in item['numbers']])
 
-        # jeta onno user ney nai seta filter
         taken = []
-        for u in stats.values(): taken.extend(u.get('numbers',[]))
+        for u in stats.values(): taken.extend([str(x) for x in u.get('numbers',[])])
+
         free = [n for n in all_available if n not in taken]
 
         if len(free) < 3:
-            await query.edit_message_text(f"❌ Stock e 3 ta free number nai. Available: {len(free)}\nAdmin ke bolo number kinte.", reply_markup=main_menu(uid)); return
+            await query.edit_message_text(
+                f"⚠️ **Insufficient Stock**\n\nAvailable Free Numbers: {len(free)}\nRequired: 3\n\nPlease contact admin to add more numbers to IPRN panel.",
+                reply_markup=main_menu(uid), parse_mode='Markdown'); return
 
         picked = random.sample(free, 3)
-        stats[str(uid)]["numbers"] = picked
+        stats[str(uid)]["numbers"].extend(picked)
         save_json(DATA_FILE, stats)
-        await query.edit_message_text(f"✅ **Tomar 3 ta Number:**\n\n" + "\n".join([f"`{n}`" for n in picked]) + "\n\nEkhon theke OTP auto forward hobe.", reply_markup=main_menu(uid), parse_mode='Markdown')
+
+        await query.edit_message_text(
+            f"✅ **3 Numbers Assigned Successfully**\n\n" + "\n".join([f"`{n}`" for n in picked]) +
+            f"\n\n📦 Total Your Numbers: {len(stats[str(uid)]['numbers'])}\n🔔 Auto Forward: Enabled",
+            reply_markup=main_menu(uid), parse_mode='Markdown')
 
     elif query.data == "my_numbers":
         nums = stats[str(uid)].get("numbers",[])
-        if not nums: await query.edit_message_text("📭 Kono number nai. 🎁 Get 3 Numbers e click koro.", reply_markup=main_menu(uid))
-        else: await query.edit_message_text(f"📞 Your Numbers ({len(nums)}/3):\n" + "\n".join([f"`{n}`" for n in nums]), reply_markup=main_menu(uid), parse_mode='Markdown')
+        if not nums: await query.edit_message_text("📭 You have no numbers. Click Get 3 Numbers.", reply_markup=main_menu(uid))
+        else: await query.edit_message_text(f"📞 **Your Numbers ({len(nums)})**\n\n" + "\n".join([f"`{n}`" for n in nums]), reply_markup=main_menu(uid), parse_mode='Markdown')
+
+    elif query.data == "my_stats":
+        d = stats[str(uid)]
+        await query.edit_message_text(f"📊 **Your Statistics**\n\nTotal Numbers: {len(d.get('numbers',[]))}\nTotal OTPs Received: {d.get('count',0)}", reply_markup=main_menu(uid), parse_mode='Markdown')
 
     elif query.data == "admin_stats" and is_admin(uid):
-        msg = "📊 **ADMIN STATS**\n\n"
+        msg = "📈 **ADMIN PANEL - DETAILED STATS**\n\n"
+        total_numbers = 0
+        total_otps = 0
         for u_id, d in stats.items():
-            msg += f"👤 `{u_id}`\nCount: {d.get('count',0)} | Numbers: {d.get('numbers',[])}\n\n"
+            total_numbers += len(d.get('numbers',[]))
+            total_otps += d.get('count',0)
+            msg += f"👤 User: `{u_id}`\n Numbers: {len(d.get('numbers',[]))} | OTPs: {d.get('count',0)}\n `{', '.join(d.get('numbers',[])[:3])}{'...' if len(d.get('numbers',[]))>3 else ''}`\n\n"
+        msg += f"\n---\n📦 Total Assigned: {total_numbers}\n📩 Total OTPs: {total_otps}"
         await query.edit_message_text(msg, reply_markup=main_menu(uid), parse_mode='Markdown')
 
-    elif query.data == "my_otps":
-        await query.edit_message_text("✅ Auto Forward ON ache. OTP asle auto inbox e chole asbe.", reply_markup=main_menu(uid))
-
-async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id): return
-    # search still allowed
-    b_num = re.sub(r'\D','', update.message.text)
-    day = datetime.now().strftime("%Y-%m-%d")
-    all_sms = api_get("/api/stock/public/edr", {"page":1,"perPage":100,"day":day}).get('data',[])
-    found = [x for x in all_sms if b_num in str(x['b_number'])]
-    if not found: await update.message.reply_text("No SMS today"); return
-    for sms in found[-2:]:
-        otp = extract_otp(sms['message'])
-        txt = f"To: {sms['b_number']}\n{sms['message']}"
-        if otp: txt+=f"\n\nOTP: {otp}"
-        await update.message.reply_text(txt)
+    elif query.data == "manage_users" and is_admin(uid):
+        users = load_json(ALLOWED_FILE, [])
+        msg = f"👥 **Allowed Users ({len(users)})**\n\n" + "\n".join([f"`{u}`" for u in users]) + "\n\nCommands:\n/add <id>\n/remove <id>"
+        await query.edit_message_text(msg, reply_markup=main_menu(uid), parse_mode='Markdown')
 
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
-    users = load_json(ALLOWED_FILE, [])
-    nid = int(context.args[0]);
-    if nid not in users: users.append(nid); save_json(ALLOWED_FILE, users)
-    await update.message.reply_text(f"Added {nid}")
+    try:
+        nid = int(context.args[0])
+        users = load_json(ALLOWED_FILE, [])
+        if nid not in users: users.append(nid); save_json(ALLOWED_FILE, users)
+        await update.message.reply_text(f"✅ User {nid} added successfully.")
+    except: await update.message.reply_text("Usage: /add 123456789")
 
 async def post_init(app):
-    # auto forwarder background e chalu
     asyncio.create_task(auto_forwarder(app))
 
 def main():
@@ -158,8 +159,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add_user))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search))
-    print("Bot with Auto Forward Running...")
     app.run_polling()
 
 if __name__ == "__main__":
