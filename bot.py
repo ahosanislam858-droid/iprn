@@ -24,47 +24,56 @@ def init_db():
 
 def clean_num(n): return re.sub(r'\D','', str(n))[-10:]
 def api_get(e,p={}):
-    try: return requests.get(f"{BASE_URL}{e}", headers=HEADERS, params=p, timeout=15).json()
-    except: return {}
+    try:
+        r=requests.get(f"{BASE_URL}{e}", headers=HEADERS, params=p, timeout=15)
+        print(f"API {p} -> {r.status_code} len {len(r.text)}")
+        return r.json()
+    except Exception as ex:
+        print(f"API Error {ex}")
+        return {}
 
 async def auto_forwarder(app):
-    print("✅ Forwarder Started - ORIGINAL WORKING VERSION")
+    print("✅ Forwarder Started")
     while True:
         await asyncio.sleep(5)
         try:
             day=datetime.now().strftime("%Y-%m-%d")
-            # Ager motoi day diye try
-            data=api_get("/api/stock/public/edr",{"page":1,"perPage":100,"day":day}).get('data',[])
-            if not data:
-                data=api_get("/api/stock/public/edr",{"page":1,"perPage":100}).get('data',[])
-            if not data: continue
+            data=api_get("/api/stock/public/edr",{"page":1,"perPage":20,"day":day})
+            all_sms=data.get('data',[])
+            if not all_sms:
+                data=api_get("/api/stock/public/edr",{"page":1,"perPage":20})
+                all_sms=data.get('data',[])
 
+            if not all_sms:
+                print("No SMS in API")
+                continue
+
+            print(f"Got {len(all_sms)} SMS from IPRN")
             conn=get_db(); cur=conn.cursor()
-            for sms in data:
+            cur.execute("SELECT user_id, number FROM user_numbers")
+            rows=cur.fetchall()
+            print(f"Checking against {len(rows)} assigned numbers: {rows}")
+
+            for sms in all_sms:
                 mid=str(sms.get('id'))
+                b_raw=str(sms.get('b_number',''))
+                msg=str(sms.get('message',''))
+                print(f"SMS ID {mid} | B: {b_raw} | MSG: {msg[:40]}")
                 cur.execute("SELECT 1 FROM seen WHERE sms_id=%s",(mid,))
                 if cur.fetchone(): continue
 
-                # Ekhane fix: b_number er sathe a_number o check
-                b_raw = str(sms.get('b_number',''))
-                sms_msg = str(sms.get('message',''))
-                b_clean = clean_num(b_raw)
-
-                cur.execute("SELECT user_id, number FROM user_numbers")
-                rows=cur.fetchall()
                 for uid, unum in rows:
-                    # ager match chilo sudhu b_clean, ekhon raw number o check korbe
-                    if clean_num(unum)==b_clean or unum in b_raw or unum in sms_msg:
-                        print(f"MATCH {unum} -> {b_raw}")
+                    if clean_num(unum) in clean_num(b_raw) or unum in b_raw or clean_num(unum) in msg or unum in msg or clean_num(b_raw) in clean_num(unum):
+                        print(f"*** MATCH {unum} == {b_raw} -> Sending to {uid}")
                         cur.execute("INSERT INTO seen VALUES (%s) ON CONFLICT DO NOTHING",(mid,))
                         cur.execute("INSERT INTO otp_stats (user_id, count) VALUES (%s,1) ON CONFLICT (user_id) DO UPDATE SET count = otp_stats.count + 1", (uid,))
                         conn.commit()
-                        txt=f"🔔 **NEW OTP**\n📱 `{unum}`\n💬 {sms_msg}"
+                        txt=f"🔔 **NEW OTP**\n📱 `{unum}`\nFrom `{b_raw}`\n💬 {msg}"
                         try: await app.bot.send_message(chat_id=int(uid), text=txt, parse_mode='Markdown')
-                        except: pass
+                        except Exception as e: print(f"Send fail {e}")
                         break
             cur.close(); conn.close()
-        except Exception as e: print(e)
+        except Exception as e: print(f"Loop Error {e}")
 
 def main_menu(uid):
     kb=[[InlineKeyboardButton("🎁 Get 3 Numbers", callback_data="get_3_numbers"), InlineKeyboardButton("📞 My Numbers", callback_data="my_numbers")]]
@@ -93,7 +102,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📞 Yours:\n" + "\n".join([f"`{n}`" for n in nums]) if nums else "No numbers", reply_markup=main_menu(uid), parse_mode='Markdown')
         elif query.data=="manage_stock":
             conn=get_db(); cur=conn.cursor(); cur.execute("SELECT COUNT(*) FROM stock"); t=cur.fetchone()[0]; cur.execute("SELECT COUNT(*) FROM user_numbers"); a=cur.fetchone()[0]; cur.close(); conn.close()
-            await query.edit_message_text(f"📦 Total:{t} Assigned:{a} Free:{t-a}\n/addstock /removestock /stock /clearstock /add /remove", reply_markup=main_menu(uid))
+            await query.edit_message_text(f"📦 Total:{t} Assigned:{a} Free:{t-a}\n/addstock /removestock /stock /clearstock /add /remove /testapi", reply_markup=main_menu(uid))
         elif query.data=="admin_stats":
             conn=get_db(); cur=conn.cursor(); cur.execute("SELECT user_id FROM users"); users=cur.fetchall()
             msg="📈 **ADMIN STATS**\n\n"
@@ -143,6 +152,21 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for a in context.args: cur.execute("DELETE FROM users WHERE user_id=%s",(int(a),)); cur.execute("DELETE FROM user_numbers WHERE user_id=%s",(int(a),)); cur.execute("DELETE FROM otp_stats WHERE user_id=%s",(int(a),))
     conn.commit(); cur.close(); conn.close(); await update.message.reply_text("User Removed")
 
+async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id!=ADMIN_ID: return
+    day=datetime.now().strftime("%Y-%m-%d")
+    data=api_get("/api/stock/public/edr",{"page":1,"perPage":5,"day":day})
+    sms=data.get('data',[])[:2]
+    if not sms:
+        data=api_get("/api/stock/public/edr",{"page":1,"perPage":5})
+        sms=data.get('data',[])[:2]
+    txt=f"API Test - Found {len(sms)} SMS\n\n"
+    for s in sms:
+        txt+=f"ID:{s.get('id')} B:{s.get('b_number')} A:{s.get('a_number')}\nMSG:{s.get('message','')[:50]}\n\n"
+    conn=get_db(); cur=conn.cursor(); cur.execute("SELECT user_id, number FROM user_numbers LIMIT 5"); rows=cur.fetchall(); cur.close(); conn.close()
+    txt+=f"Your assigned: {rows}"
+    await update.message.reply_text(txt[:4000])
+
 async def post_init(app): init_db(); asyncio.create_task(auto_forwarder(app))
 
 def main():
@@ -154,6 +178,7 @@ def main():
     app.add_handler(CommandHandler("removestock", remove_stock))
     app.add_handler(CommandHandler("stock", stock_list))
     app.add_handler(CommandHandler("clearstock", clear_stock))
+    app.add_handler(CommandHandler("testapi", test_api))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.run_polling()
 if __name__=="__main__": main()
