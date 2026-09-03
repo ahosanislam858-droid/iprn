@@ -27,8 +27,9 @@ def api_get(e,p={}):
     try: return requests.get(f"{BASE_URL}{e}", headers=HEADERS, params=p, timeout=15).json()
     except: return {}
 
+# ... same init part ...
 async def auto_forwarder(app):
-    print("✅ Forwarder Fixed - ID None Bug Fixed")
+    print("✅ Forwarder - Auto Copy Enabled")
     while True:
         await asyncio.sleep(4)
         try:
@@ -40,27 +41,31 @@ async def auto_forwarder(app):
             cur.execute("SELECT user_id, number FROM user_numbers")
             rows=cur.fetchall()
             for sms in data:
-                b_raw=str(sms.get('b_number','') or sms.get('to','') or sms.get('number',''))
-                msg=str(sms.get('message','') or sms.get('text','') or sms.get('otp',''))
+                b_raw=str(sms.get('b_number','') or sms.get('to',''))
+                msg=str(sms.get('message','') or sms.get('text',''))
                 if not b_raw or not msg: continue
-                # ID None bug fix - unique id banabo
-                raw_id = str(sms.get('id') or sms.get('_id') or sms.get('sms_id') or "")
-                if raw_id=="None" or raw_id=="" or raw_id=="null":
+                raw_id = str(sms.get('id') or sms.get('_id') or "")
+                if raw_id in ["None","", "null"]:
                     raw_id = hashlib.md5(f"{b_raw}_{msg}".encode()).hexdigest()
-                mid=raw_id
-                cur.execute("SELECT 1 FROM seen WHERE sms_id=%s",(mid,))
+                cur.execute("SELECT 1 FROM seen WHERE sms_id=%s",(raw_id,))
                 if cur.fetchone(): continue
                 for uid, unum in rows:
-                    # exact match + last 10 match
                     if unum==b_raw or clean_num(unum)==clean_num(b_raw) or unum in msg:
-                        print(f"MATCH {unum} == {b_raw} MSG {msg}")
-                        cur.execute("INSERT INTO seen VALUES (%s) ON CONFLICT DO NOTHING",(mid,))
+                        cur.execute("INSERT INTO seen VALUES (%s) ON CONFLICT DO NOTHING",(raw_id,))
                         cur.execute("INSERT INTO otp_stats (user_id, count) VALUES (%s,1) ON CONFLICT (user_id) DO UPDATE SET count = otp_stats.count + 1", (uid,))
                         conn.commit()
-                        txt=f"🔔 **NEW OTP**\n📱 `{unum}`\n💬 {msg}"
-                        try: await app.bot.send_message(chat_id=int(uid), text=txt, parse_mode='Markdown')
-                        except: pass
+                        otp = re.search(r'\b\d{4,8}\b', msg)
+                        otp_code = otp.group(0) if otp else msg.strip()[:8]
+                        # Auto Copy Fix - HTML <code> tag
+                        txt = f"🔔 <b>NEW OTP RECEIVED</b>\n\n📱 Number: <code>{unum}</code>\n📩 From: {b_raw}\n\n💬 {msg}\n\n🔑 OTP: <code>{otp_code}</code>\n\n👉 Tap on code to copy"
+                        try:
+                            await app.bot.send_message(chat_id=int(uid), text=txt, parse_mode='HTML')
+                            print(f"Sent copyable OTP {otp_code} to {uid}")
+                        except Exception as e: print(e)
                         break
+            cur.close(); conn.close()
+        except Exception as e: print(e)
+# ... baki sob same ...
             cur.close(); conn.close()
         except Exception as e: print(f"Error {e}")
 
